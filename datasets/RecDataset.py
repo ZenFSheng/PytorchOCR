@@ -1,71 +1,84 @@
-"""
+'''
 @Author: Jeffery Sheng (Zhenfei Sheng)
-@Time:   2020/5/21 19:44
-@File:   ICDAR15RecDataset.py
-"""
+@Time:   2020/6/8 19:44
+@File:   RecDataset.py
+'''
 
-import os
 import cv2
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from utils import StrLabelConverter
 from util_scripts.CreateRecAug import cv2pil, pil2cv, RandomBrightness, RandomContrast, \
-    RandomLine, RandomSharpness, Compress, Rotate, \
-    Blur, MotionBlur, Salt, AdjustResolution
+                                      RandomLine, RandomSharpness, Compress, Rotate, \
+                                      Blur, MotionBlur, Salt, AdjustResolution
 
 
-class ICDAR15RecDataset(Dataset):
+class RecDataset(Dataset):
     def __init__(self, config):
         """
-        :param config: dataset config, need data_dir, input_h, mean, std,
-        mode:'train' or 'val', augmentation: True or False,
-        batch_size, shuffle, num_workers
+        :param config: dataset config, need: textline, input_h, input_w
+         mean, std, augmentation, alphabet
         """
-        self.config = config
-        self.data_dir = config.data_dir
-        self.input_h = config.input_h
-        self.mode = config.mode
+        self.textline = config.textline
         self.alphabet = config.alphabet
         self.mean = np.array(config.mean, dtype=np.float32)
         self.std = np.array(config.std, dtype=np.float32)
         self.augmentation = config.augmentation
+        self.process = RecDataProcess(config)
 
         # get alphabet
         with open(self.alphabet, 'r') as file:
             alphabet = ''.join([s.strip('\n') for s in file.readlines()])
+
         # get converter
         self.converter = StrLabelConverter(alphabet, False)
 
-        # build path of train.txt of val.txt
-        gt_path = os.path.join(self.data_dir, f'{self.mode}.txt')
-        with open(gt_path, 'r', encoding='utf-8') as file:
-            # build {img_path: trans}
-            self.labels = []
-            for m_line in file:
-                m_image_name, m_gt_text = m_line.strip().split('\t')
-                self.labels.append((m_image_name, m_gt_text))
+        # preload all text boxes & trans
+        self.data = self.get_data()
 
         print(f'load {self.__len__()} images.')
 
-    def _find_max_length(self):
-        return max({len(_[1]) for _ in self.labels})
+    def get_data(self):
+        # read textline
+        with open(self.textline, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+        # get labels
+        data = list()
+        for line in lines:
+            img_path, gt_path = line.rstrip('\n').split('\t')
+            # read box & trans
+            with open(gt_path, 'r', encoding='utf-8-sig') as file:
+                boxes_trans = file.readlines()
+            # build (img_path, [clockwise coords], trans)
+            for item in boxes_trans:
+                item = item.rstrip('\n').split(',')
+                box, trans = item[: 8], ''.join(item[8: ])
+                # drop fuzzy label
+                if trans in {'', '*', '###'}:
+                    continue
+                #  add to labels
+                data += [(img_path, box, trans)]
+        return data
 
     def __len__(self):
-        return len(self.labels)
+        return len(self.data)
 
     def __getitem__(self, index):
-        # get img_path and trans
-        img_name, trans = self.labels[index]
-        img_path = os.path.join(self.data_dir, 'image', img_name)
+        # get ori_img_path, box, trans
+        ori_img_path, box, trans = self.data[index]
 
         # convert to label
         label, length = self.converter.encode(trans)
-        # read img
-        img = cv2.imread(img_path)
+
+        # read ori_img
+        ori_img = cv2.imread(ori_img_path)
+        # crop box img
+        img = self.process.crop(ori_img, box)
         # do aug
         if self.augmentation:
-            img = pil2cv(RecDataProcess(self.config).aug_img(cv2pil(img)))
+            img = pil2cv(self.process.aug_img(cv2pil(img)))
+
         return img, label, length
 
 
@@ -73,14 +86,15 @@ class RecDataLoader:
     def __init__(self, dataset, config):
         self.dataset = dataset
         self.process = RecDataProcess(config)
-        self.len_thresh = self.dataset._find_max_length() // 2
+        self.input_w = config.input_w
         self.batch_size = config.batch_size
         self.shuffle = config.shuffle
         self.num_workers = config.num_workers
         self.iteration = 0
         self.dataiter = None
-        self.queue_1 = list()
-        self.queue_2 = list()
+
+        # num_data_cache can be modified in config
+        self.num_cache = config.num_cache
 
     def __len__(self):
         return len(self.dataset) // self.batch_size if len(self.dataset) % self.batch_size == 0 \
@@ -88,6 +102,12 @@ class RecDataLoader:
 
     def __iter__(self):
         return self
+
+    def init_caches(self):
+        # build data cache
+        self.caches = dict()
+        for i in range(self.num_cache):
+            self.caches[i] = list()
 
     def pack(self, batch_data):
         batch = [[], [], []]
@@ -114,47 +134,49 @@ class RecDataLoader:
                                    shuffle=self.shuffle, num_workers=self.num_workers).__iter__()
 
     def __next__(self):
+        # initialize iteration
         if self.dataiter == None:
+            self.init_caches()
             self.build()
-        if self.iteration == len(self.dataset) and len(self.queue_2):
-            batch_data = self.queue_2
-            self.queue_2 = list()
+
+        while self.iteration < len(self.dataiter):
+            temp = self.dataiter.__next__()
+            self.iteration += 1
+
+            cache_id = temp[0].shape[1] // self.input_w
+            self.caches[cache_id].append(temp)
+
+            caches_length = [len(self.caches[_]) for _ in self.caches]
+            max_cache_length = max(caches_length)
+
+            if max_cache_length == self.batch_size:
+                max_length_id = int(np.argmax(caches_length))
+                batch_data = self.caches[max_length_id]
+                self.caches[max_length_id] = list()
+
+                return self.pack(batch_data)
+
+        else:
+            if not hasattr(self, 'rest')  and self.caches is not None:
+                # judge whether caches empty
+                self.rest = list()
+                for k in self.caches:
+                    self.rest += self.caches[k]
+                self.caches = None
+
+        while hasattr(self, 'rest') and len(self.rest):
+            if len(self.rest) > self.batch_size:
+                batch_data = self.rest[: self.batch_size]
+                self.rest = self.rest[self.batch_size: ]
+            else:
+                batch_data = self.rest
+                self.rest = list()
             return self.pack(batch_data)
-        if not len(self.queue_2) and not len(self.queue_1) and self.iteration == len(self.dataset):
+        else:
             self.iteration = 0
             self.dataiter = None
+            delattr(self, 'rest')
             raise StopIteration
-        # start iteration
-        try:
-            while True:
-                # get data from origin dataloader
-                temp = self.dataiter.__next__()
-                self.iteration += 1
-                # to different queue
-                if temp[2].item() <= self.len_thresh:
-                    self.queue_1.append(temp)
-                else:
-                    self.queue_2.append(temp)
-
-                # to store batch data
-                batch_data = None
-                # queue_1 full, push to batch_data
-                if len(self.queue_1) == self.batch_size:
-                    batch_data = self.queue_1
-                    self.queue_1 = list()
-                # or queue_2 full, push to batch_data
-                elif len(self.queue_2) == self.batch_size:
-                    batch_data = self.queue_2
-                    self.queue_2 = list()
-
-                # start to process batch
-                if batch_data is not None:
-                    return self.pack(batch_data)
-        # deal with last batch
-        except StopIteration:
-            batch_data = self.queue_1
-            self.queue_1 = list()
-            return self.pack(batch_data)
 
 
 class RecDataProcess:
@@ -195,6 +217,20 @@ class RecDataProcess:
         img = self.salt.process(img)
         return img
 
+    def crop(self, img, box):
+        # get points, adapt float
+        x1, y1, x2, y2, x3, y3, x4, y4 = list(map(int, map(round, map(float, box))))
+        # check if rectangle
+        if len({x1, y1, x2, y2, x3, y3, x4, y4}) == 4:
+            # crop rectangle
+            img = img[y1: y4, x1: x2]
+        # if polygon, crop minimize circumscribed rectangle
+        else:
+            x_min, x_max = min((x1, x2, x3, x4)), max((x1, x2, x3, x4))
+            y_min, y_max = min((y1, y2, y3, y4)), max((y1, y2, y3, y4))
+            img = img[y_min: y_max, x_min: x_max]
+        return img
+
     def resize_with_specific_height(self, _img):
         """
         将图像resize到指定高度
@@ -224,3 +260,31 @@ class RecDataProcess:
         to_return_img = np.ones([_height, _target_width, _channels]) * _pad_value
         to_return_img[:_height, :_width, :] = _img
         return to_return_img
+
+
+
+if __name__ == '__main__':
+    # load test
+    import config
+    from tqdm import tqdm
+
+    dataset = RecDataset(config)
+    dataloader = RecDataLoader(dataset, config)
+    # dataloader = DataLoader(dataset, batch_size=1)
+
+    # print(list(dataloader))
+    # count = 0
+    for i in range(10):
+        count = 0
+        for batch in tqdm(dataloader):
+        # for batch in dataloader:
+            count += batch[0].shape[0]
+        #     print('-'*100)
+        #     print(batch[0].shape, batch[1].shape, batch[2].shape)
+        #     print('-'*100)
+    #        count += 1
+    #     if count == 2:
+    #         exit()
+    #         print(count)
+        print(count)
+            # pass
